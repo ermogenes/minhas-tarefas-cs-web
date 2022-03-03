@@ -70,3 +70,21 @@ app.MapGet("/api/tarefas", ([FromServices] tarefasContext _db) =>
 });
 ...
 ```
+
+# Segurança
+
+Hashing de senha:
+```
+dotnet add package CryptoHelper
+```
+
+Autenticação e autorização com JWT:
+```
+dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer
+```
+
+# Solução
+
+```
+dotnet new sln
+```
