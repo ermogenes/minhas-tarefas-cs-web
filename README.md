@@ -1,6 +1,8 @@
 # tarefas-cs-web
 Uma aplicação em C# (web) com Minimal APIs, EFCore 6, MySQL e Pomelo
 
+[![Build and test](https://github.com/ermogenes/minhas-tarefas-cs-web/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/ermogenes/minhas-tarefas-cs-web/actions/workflows/build-and-test.yml)
+
 ## OpenAPI (Swagger)
 Pacote:
 ```
