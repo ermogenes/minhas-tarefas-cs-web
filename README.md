@@ -24,7 +24,7 @@ app.UseStaticFiles();
 ```
 
 ## EntityFramework Core 6 (MySQL com Pomelo)
-Banco: https://github.com/ermogenes/tarefas-mysql
+Banco: https://github.com/ermogenes/minhas-tarefas-mysql
 
 Para subir o MySQL com Docker:
 ```
@@ -87,4 +87,31 @@ dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer
 
 ```
 dotnet new sln
+```
+
+# Testes
+
+Criar a solução:
+```
+dotnet new xunit -o Tarefas.Tests
+```
+
+Adicionar a referência do projeto nos testes:
+```
+dotnet add reference ../Tarefas/Tarefas.csproj
+```
+
+Adicionar os pacotes:
+```
+dotnet add package Microsoft.AspNetCore.Mvc.Testing
+```
+```
+dotnet add package Moq
+```
+
+Tornar o `Program` do projeto acessível aos testes:
+```
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tarefas.Tests" />
+  </ItemGroup>
 ```

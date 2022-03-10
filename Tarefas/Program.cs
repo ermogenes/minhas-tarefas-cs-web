@@ -1,4 +1,5 @@
 using Tarefas.db;
+using Tarefas.Repository;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -8,9 +9,20 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Security.Claims;
 using Microsoft.OpenApi.Models;
-using Microsoft.AspNetCore.Authorization;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Configurações de segurança do ambiente
+var ConfiguracoesSeguranca = new
+{
+  emissor = builder.Configuration["ConfiguracoesJwt:Emissor"],
+  audiencia = builder.Configuration["ConfiguracoesJwt:Audiencia"],
+  chaveSimetrica = new SymmetricSecurityKey(
+    Encoding.UTF8.GetBytes(builder.Configuration["ConfiguracoesJwt:Chave"])
+  ),
+  minutosValidade = Convert.ToInt32(builder.Configuration["ConfiguracoesJwt:MinutosValidade"]),
+};
 
 // Configuração da conexão com o BD
 builder.Services.AddDbContext<tarefasContext>(opt =>
@@ -26,6 +38,10 @@ builder.Services.AddDbContext<tarefasContext>(opt =>
   // Deixa a conexão disponível para ser usada nos endpoints
   opt.UseMySql(connectionString, serverVersion);
 });
+
+// Adiciona o repositório como serviço
+// Será instanciado usando o contexto injetado
+builder.Services.AddScoped<ITarefasRepository, TarefasRepository>();
 
 // Gera a UI do OpenAPI (Swagger)
 builder.Services.AddSwaggerGen(opt =>
@@ -82,13 +98,11 @@ builder.Services
       {
         // Valida issuer, audience e a chave do issuer, além do tempo de vida
         ValidateIssuer = true,
-        ValidIssuer = builder.Configuration["ConfiguracoesJwt:Emissor"],
+        ValidIssuer = ConfiguracoesSeguranca.emissor,
         ValidateAudience = true,
-        ValidAudience = builder.Configuration["ConfiguracoesJwt:Audiencia"],
+        ValidAudience = ConfiguracoesSeguranca.audiencia,
         ValidateIssuerSigningKey = true,
-        IssuerSigningKey = new SymmetricSecurityKey(
-          Encoding.UTF8.GetBytes(builder.Configuration["ConfiguracoesJwt:Chave"])
-        ),
+        IssuerSigningKey = ConfiguracoesSeguranca.chaveSimetrica,
         ValidateLifetime = true,
       };
     });
@@ -98,8 +112,16 @@ builder.Services.AddAuthorization(opt =>
 {
   // Cria uma política em que o usuário deve estar logado com perfil "admin"
   opt.AddPolicy("SomenteAdmin", policy =>
-    policy.RequireAuthenticatedUser().RequireRole("admin")
+    policy
+      .RequireAuthenticatedUser()
+      .RequireRole("admin")
   );
+});
+
+// Garante que a conversão para JSON não entrará em loop
+builder.Services.Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(opt =>
+{
+  opt.SerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
 });
 
 var app = builder.Build();
@@ -114,6 +136,11 @@ if (app.Environment.IsDevelopment())
   app.UseSwagger();
   app.UseSwaggerUI();
 }
+else
+{
+  // Em produção, usar um endpoint de erro
+  app.UseExceptionHandler("/api/erro");
+}
 
 // Serve arquivos estáticos contidos em "./wwwroot"
 app.UseDefaultFiles();
@@ -125,45 +152,22 @@ app.UseAuthorization();
 
 // Cria os endpoints da API
 
-////////// Recupera todas as tarefas, por nome, com filtros de pendência
-app.MapGet("/api/tarefas", ([FromServices] tarefasContext _db,
+// ------------- Recupera todas as tarefas, por nome, com filtros de pendência
+app.MapGet("/api/tarefas", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
   [FromQuery(Name = "somente_pendentes")] bool? somentePendentes,
-  [FromQuery] string? descricao,
-  HttpContext HttpContext
+  [FromQuery] string? descricao
 ) =>
 {
-  // Cria query partindo da tabela Tarefa
-  var query = _db.Tarefa.AsQueryable<Tarefa>();
-
-  // Adiciona filtro por descrição caso tenha sido informada
-  if (!String.IsNullOrEmpty(descricao))
-  {
-    query = query.Where(t => t.Descricao.Contains(descricao));
-  }
-
-  // Filtro de pendência desativado por padrão
-  bool filtrarPendentes = somentePendentes ?? false;
-
-  // Caso tenha sido informado, adiciona filtro de pendência
-  // A ordenação não é necessária, foi inserida por ilustração
-  if (filtrarPendentes)
-  {
-    query = query.Where(t => !t.Concluida)
-      .OrderByDescending(t => t.Id);
-  }
-
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
-  // Busca todas as tarefas do usuário logado, incluindo os filtros
-  var tarefas = query
-    .Where(t => t.UsuarioId == usuarioId)
-    .ToList<Tarefa>();
+  // Busca as tarefas
+  var tarefas = repo.ObtemTarefas(descricao, somentePendentes, usuarioId);
 
   // Retorna 204 caso não possua tarefas
-  if (tarefas.Count == 0)
+  if (tarefas.Count() == 0)
   {
     return Results.NoContent();
   }
@@ -171,21 +175,20 @@ app.MapGet("/api/tarefas", ([FromServices] tarefasContext _db,
   // Retorna 200, com os dados
   return Results.Ok(tarefas);
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
-.Produces<List<Tarefa>>(StatusCodes.Status200OK)
+.RequireAuthorization() // Somente usuários logados
+.Produces<Tarefa>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status204NoContent)
 .Produces(StatusCodes.Status401Unauthorized);
 
-////////// Recupera uma tarefa, pelo id
-app.MapGet("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
-  [FromRoute] int id,
-  HttpContext HttpContext
+// ------------- Recupera uma tarefa, pelo id
+app.MapGet("/api/tarefas/{id}", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
+  [FromRoute] int id
 ) =>
 {
   // Busca pelo id indicado
-  var tarefa = _db.Tarefa.Find(id);
+  var tarefa = repo.ObtemTarefaPorId(id);
 
   // Caso não encontrado, retorna 404
   if (tarefa == null)
@@ -194,15 +197,10 @@ app.MapGet("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
   }
 
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
-
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
   // Se não for admin nem for dono da tarefa, retorna 403
-  if (!usuarioAdministrador && tarefa.UsuarioId != usuarioId)
+  if (!UsuarioEhAdmin(usuarioLogado) && tarefa.UsuarioId != usuarioId)
   {
     return Results.Forbid();
   }
@@ -210,18 +208,17 @@ app.MapGet("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
   // Retorna 200, com os dados
   return Results.Ok(tarefa);
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
+.RequireAuthorization() // Somente usuários logados
 .Produces<Tarefa>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden)
 .Produces(StatusCodes.Status404NotFound);
 
-////////// Adiciona uma tarefa à lista do usuário logado
-app.MapPost("/api/tarefas", ([FromServices] tarefasContext _db,
-  [FromBody] Tarefa novaTarefa,
-  HttpContext HttpContext
+// ------------- Adiciona uma tarefa à lista do usuário logado
+app.MapPost("/api/tarefas", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
+  [FromBody] Tarefa novaTarefa
 ) =>
 {
   // Caso não envie descrição, retorna 400
@@ -230,16 +227,17 @@ app.MapPost("/api/tarefas", ([FromServices] tarefasContext _db,
     return Results.BadRequest(new { mensagem = "Não é possivel incluir tarefa sem título." });
   }
 
+  // Caso envie tarefa concluída, retorna 400
+  if (novaTarefa.Concluida)
+  {
+    return Results.BadRequest(new { mensagem = "Não é permitido incluir tarefa já concluída." });
+  }
+
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
-
-  // Se não for admin nem for o dono indicado na tarefa, retorna 403
-  if (!usuarioAdministrador && novaTarefa.UsuarioId != usuarioId)
+  // Se não for o dono indicado na tarefa, retorna 403
+  if (novaTarefa.UsuarioId != usuarioId)
   {
     return Results.Forbid();
   }
@@ -247,34 +245,32 @@ app.MapPost("/api/tarefas", ([FromServices] tarefasContext _db,
   // Cria a tarefa para o usuário logado, com os dados indicados
   var tarefa = new Tarefa
   {
+    UsuarioId = usuarioId,
     Descricao = novaTarefa.Descricao,
     Concluida = novaTarefa.Concluida,
-    UsuarioId = usuarioId,
   };
 
   // Grava a tarefa
-  _db.Add(tarefa);
-  _db.SaveChanges();
+  var tarefaCriada = repo.AdicionaTarefa(tarefa);
 
   // URL da tarefa recém criada
-  var tarefaUrl = $"/api/tarefas/{tarefa.Id}";
+  var tarefaUrl = $"/api/tarefas/{tarefaCriada.Id}";
 
   // Retorna 201, com o URL criado e os dados
-  return Results.Created(tarefaUrl, tarefa);
+  return Results.Created(tarefaUrl, tarefaCriada);
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
+.RequireAuthorization() // Somente usuários logados
 .Produces<Tarefa>(StatusCodes.Status201Created)
 .Produces(StatusCodes.Status400BadRequest)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden);
 
-////////// Altera uma tarefa do usuário logado
-app.MapPut("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
+// ------------- Altera uma tarefa do usuário logado
+app.MapPut("/api/tarefas/{id}", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
   [FromRoute] int id,
-  [FromBody] Tarefa tarefaAlterada,
-  HttpContext HttpContext
+  [FromBody] Tarefa tarefaAlterada
 ) =>
 {
   // Verifica se a tarefa indicada é a mesma da enviada, retornando 400 caso não seja
@@ -290,7 +286,7 @@ app.MapPut("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
   }
 
   // Busca pelo id indicado
-  var tarefa = _db.Tarefa.Find(id);
+  var tarefa = repo.ObtemTarefaPorId(id);
 
   // Caso não encontrado, retorna 404
   if (tarefa == null)
@@ -305,44 +301,36 @@ app.MapPut("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
   }
 
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
-
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
   // Se não for admin nem for o dono indicado na tarefa, retorna 403
-  if (!usuarioAdministrador && tarefaAlterada.UsuarioId != usuarioId)
+  if (!UsuarioEhAdmin(usuarioLogado) && tarefaAlterada.UsuarioId != usuarioId)
   {
     return Results.Forbid();
   }
 
   // Altera a tarefa
-  tarefa.Descricao = tarefaAlterada.Descricao;
-  tarefa.Concluida = tarefaAlterada.Concluida;
-  _db.SaveChanges();
+  var tarefaRetorno = repo.AlteraTarefa(tarefaAlterada);
 
   // Retorna 200, com os dados
-  return Results.Ok(tarefa);
+  return Results.Ok(tarefaRetorno);
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
+.RequireAuthorization() // Somente usuários logados
 .Produces<Tarefa>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status400BadRequest)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden)
 .Produces(StatusCodes.Status404NotFound);
 
-////////// Altera a situação de conclusão de uma tarefa do usuário logado
-app.MapMethods("/api/tarefas/{id}/concluir", new[] { "PATCH" }, ([FromServices] tarefasContext _db,
-  [FromRoute] int id,
-  HttpContext HttpContext
+// ------------- Altera a situação de conclusão de uma tarefa do usuário logado
+app.MapMethods("/api/tarefas/{id}/concluir", new[] { "PATCH" }, (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
+  [FromRoute] int id
 ) =>
 {
   // Busca pelo id indicado
-  var tarefa = _db.Tarefa.Find(id);
+  var tarefa = repo.ObtemTarefaPorId(id);
 
   // Caso não encontrado, retorna 404
   if (tarefa == null)
@@ -357,43 +345,36 @@ app.MapMethods("/api/tarefas/{id}/concluir", new[] { "PATCH" }, ([FromServices] 
   }
 
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
-
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
   // Se não for admin nem for dono da tarefa, retorna 403
-  if (!usuarioAdministrador && tarefa.UsuarioId != usuarioId)
+  if (!UsuarioEhAdmin(usuarioLogado) && tarefa.UsuarioId != usuarioId)
   {
     return Results.Forbid();
   }
 
   // Altera a tarefa
-  tarefa.Concluida = true;
-  _db.SaveChanges();
+  var tarefaAlterada = repo.ConcluiTarefa(id);
 
   // Retorna 200, com os dados
-  return Results.Ok(tarefa);
+  return Results.Ok(tarefaAlterada);
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
+.RequireAuthorization() // Somente usuários logados
 .Produces<Tarefa>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden)
 .Produces(StatusCodes.Status400BadRequest)
 .Produces(StatusCodes.Status404NotFound);
 
-////////// Exclui uma tarefa do usuário logado
-app.MapDelete("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
-  [FromRoute] int id,
-  HttpContext HttpContext
+// ------------- Exclui uma tarefa do usuário logado
+app.MapDelete("/api/tarefas/{id}", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
+  [FromRoute] int id
 ) =>
 {
   // Busca pelo id indicado
-  var tarefa = _db.Tarefa.Find(id);
+  var tarefa = repo.ObtemTarefaPorId(id);
 
   // Caso não encontrado, retorna 404
   if (tarefa == null)
@@ -402,63 +383,58 @@ app.MapDelete("/api/tarefas/{id}", ([FromServices] tarefasContext _db,
   }
 
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
-
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
   // Se não for admin nem for o dono indicado na tarefa, retorna 403
-  if (!usuarioAdministrador && tarefa.UsuarioId != usuarioId)
+  if (!UsuarioEhAdmin(usuarioLogado) && tarefa.UsuarioId != usuarioId)
   {
     return Results.Forbid();
   }
 
   // Exclui a tarefa
-  _db.Remove(tarefa);
-  _db.SaveChanges();
+  repo.ExcluiTarefa(id);
 
   // Retorna 200
   return Results.Ok();
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
+.RequireAuthorization() // Somente usuários logados
 .Produces(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden)
 .Produces(StatusCodes.Status404NotFound);
 
-////////// Listagem de usuários
-app.MapGet("/api/usuarios", ([FromServices] tarefasContext _db) =>
+// ------------- Listagem de usuários
+app.MapGet("/api/usuarios", (
+  [FromServices] ITarefasRepository repo
+) =>
 {
   // Busca todos os usuários, exceto campo senha
-  var usuarios = _db.Usuario
-    .Select(u => new { u.Id, u.Nome, u.Papel })
-    .ToList();
+  var usuarios = repo.ObtemTodosUsuarios();
+
+  // Retira as senhas
+  var usuariosSemSenha = usuarios
+    .ToList<Usuario>()
+    .Select(u =>
+      new Usuario { Id = u.Id, Nome = u.Nome, Senha = "", Papel = u.Papel }
+    );
 
   // Retorna 200, com os dados
-  return Results.Ok(usuarios);
+  return Results.Ok(usuariosSemSenha);
 })
-// Somente usuários logados e com perfil de administrador
-.RequireAuthorization("SomenteAdmin")
-// Documentação OpenAPI
+.RequireAuthorization("SomenteAdmin") // Somente administradores logados
 .Produces<Usuario>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden);
 
-////////// Dados de um usuário, pelo id
-app.MapGet("/api/usuarios/{id}", ([FromServices] tarefasContext _db,
-  [FromRoute] string id,
-  HttpContext HttpContext,
-  IAuthorizationService auth
+// ------------- Dados de um usuário, pelo id
+app.MapGet("/api/usuarios/{id}", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
+  [FromRoute] string id
 ) =>
 {
   // Busca o usuário indicado, exceto campo senha
-  var usuario = _db.Usuario
-    .Select(u => new { u.Id, u.Nome, u.Papel })
-    .SingleOrDefault(u => u.Id == id);
+  var usuario = repo.ObtemUsuarioPorId(id);
 
   // Caso não encontrado, retorna 404
   if (usuario == null)
@@ -467,39 +443,42 @@ app.MapGet("/api/usuarios/{id}", ([FromServices] tarefasContext _db,
   }
 
   // Recupera o id do usuário logado
-  string usuarioId = HttpContext.User.Claims
-    .Single(c => c.Type == ClaimTypes.Name)
-    .Value;
-
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
+  string usuarioId = ObtemIdUsuarioLogado(usuarioLogado);
 
   // Se não for admin nem o próprio usuário, retorna 403
-  if (!usuarioAdministrador && usuarioId != id)
+  if (!UsuarioEhAdmin(usuarioLogado) && usuarioId != id)
   {
     return Results.Forbid();
   }
 
+  // Remove a senha do objeto a retornar
+  var usuarioSemSenha = new Usuario
+  {
+    Id = usuario.Id,
+    Nome = usuario.Nome,
+    Senha = "",
+    Papel = usuario.Papel
+  };
+
   // Retorna 200, com os dados
-  return Results.Ok(usuario);
+  return Results.Ok(usuarioSemSenha);
 })
-// Somente usuários logados, qualquer perfil
-.RequireAuthorization()
-// Documentação OpenAPI
+.RequireAuthorization() // Somente usuários logados
 .Produces<Usuario>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden)
 .Produces(StatusCodes.Status404NotFound);
 
-////////// Adiciona um novo usuário
-app.MapPost("/api/usuarios", ([FromServices] tarefasContext _db,
-  [FromBody] Usuario novoUsuario,
-  HttpContext HttpContext
+// ------------- Adiciona um novo usuário
+app.MapPost("/api/usuarios", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
+  [FromBody] Usuario novoUsuario
 ) =>
 {
-  // Valida o nome de usuário (alfanumérico ou _, de tamanho 3 a 50), retorna 400 caso inválido
+  // Valida o id de usuário (alfanumérico ou _, de tamanho 3 a 50), retorna 400 caso inválido
   novoUsuario.Id = novoUsuario.Id.ToLower();
-  if (!Regex.IsMatch(novoUsuario.Id, "^[a-z0-9_]{3,50}$"))
+  if (IdValido(novoUsuario.Id))
   {
     return Results.BadRequest(new { mensagem = "Nome de usuário deve conter somente de 3 a 50 caracteres alfanuméricos ou '_'." });
   }
@@ -517,24 +496,21 @@ app.MapPost("/api/usuarios", ([FromServices] tarefasContext _db,
   }
 
   // Verifica se usuário com o id desejado já existe, retorna 409 caso já exista
-  var usuarioJaExiste = _db.Usuario.Find(novoUsuario.Id) != null;
-  if (usuarioJaExiste)
+  if (repo.UsuarioJaCadastrado(novoUsuario.Id))
   {
     return Results.Conflict(new { mensagem = "Nome de usuário não está disponível." });
   }
 
-  // Verifica se usuário logado é administrador
-  bool usuarioAdministrador = HttpContext.User.IsInRole("admin");
-
-  // Caso esteja tentando criar um usuário com papel diferente do padrão...
-  if (!usuarioAdministrador && novoUsuario.Papel != "usuario")
+  // Somente admin pode criar um usuário com papel diferente do padrão
+  if (novoUsuario.Papel != "usuario" && !UsuarioEhAdmin(usuarioLogado))
   {
-    // ... se estiver logado, retorna 403
-    if (HttpContext.User.Identity?.IsAuthenticated ?? false)
+    if (UsuarioEstahAutenticado(usuarioLogado))
     {
+      // Se estiver logado, retorna 403
       return Results.Forbid();
     }
-    // ... se não estiver logado, retorna 401
+
+    // Se não estiver logado, retorna 401
     return Results.Unauthorized();
   }
 
@@ -543,20 +519,20 @@ app.MapPost("/api/usuarios", ([FromServices] tarefasContext _db,
   {
     Id = novoUsuario.Id,
     Nome = novoUsuario.Nome.Trim(),
-    Senha = CryptoHelper.Crypto.HashPassword(novoUsuario.Senha),
+    Senha = CriaHash(novoUsuario.Senha),
     Papel = novoUsuario.Papel,
   };
 
   // Adiciona o usuário
-  _db.Add(usuario);
-  _db.SaveChanges();
+  var usuarioCriado = repo.AdicionaUsuario(usuario);
 
-  // Remove a senha do usuário a ser retornado
+  // Retira a senha
   var usuarioSemSenha = new Usuario
   {
-    Id = usuario.Id,
-    Nome = usuario.Nome,
-    Papel = usuario.Papel,
+    Id = usuarioCriado.Id,
+    Nome = usuarioCriado.Nome,
+    Senha = "",
+    Papel = usuarioCriado.Papel
   };
 
   // URL do usuário recém criado
@@ -565,22 +541,22 @@ app.MapPost("/api/usuarios", ([FromServices] tarefasContext _db,
   // Retorna 201, com o URL criado e os dados
   return Results.Created(usuarioUrl, usuarioSemSenha);
 })
-// Permite acesso anônimo (não logado)
-.AllowAnonymous()
-// Documentação OpenAPI
+.AllowAnonymous() // Permite acesso anônimo (não logado)
 .Produces<Usuario>(StatusCodes.Status201Created)
 .Produces(StatusCodes.Status400BadRequest)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status403Forbidden)
 .Produces(StatusCodes.Status409Conflict);
 
-////////// Efetua login de usuário, com senha
-app.MapPost("/api/login", ([FromServices] tarefasContext _db,
+// ------------- Efetua login de usuário, com senha
+app.MapPost("/api/login", (
+  [FromServices] ITarefasRepository repo,
+  ClaimsPrincipal usuarioLogado,
   [FromBody] DadosLogin dadosParaLogin
 ) =>
 {
   // Busca pelo usuário
-  var usuario = _db.Usuario.SingleOrDefault(u => u.Id == dadosParaLogin.usuario);
+  var usuario = repo.ObtemUsuarioPorId(dadosParaLogin.usuario);
 
   // Caso não encontrado, retorna 401
   if (usuario is null)
@@ -589,17 +565,45 @@ app.MapPost("/api/login", ([FromServices] tarefasContext _db,
   }
 
   // Caso a senha enviada não bata com a senha armazenada para o usuário, retorna 401
-  if (!CryptoHelper.Crypto.VerifyHashedPassword(usuario.Senha, dadosParaLogin.senha))
+  if (!SenhaConfere(usuario.Senha, dadosParaLogin.senha))
   {
     return Results.Unauthorized();
   }
 
-  // A partir daqui, sabemos que o usuário e senha batem
+  // Cria o token JWT
+  var token = CriaToken(usuario);
 
-  // Recupera as configurações de emissor e audiência
-  var emissor = builder.Configuration["ConfiguracoesJwt:Emissor"];
-  var audiencia = builder.Configuration["ConfiguracoesJwt:Audiencia"];
+  // Retorna 200, com o token
+  return Results.Ok(token);
+})
+.AllowAnonymous() // Permite acesso anônimo (não logado)
+.Produces(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status401Unauthorized);
 
+// Trata exceções em produção com erro 500 (rfc7231)
+app.Map("/api/erro", () => Results.Problem());
+
+app.Run();
+
+// Funções auxiliares
+bool IdValido(string id) => !Regex.IsMatch(id, "^[a-z0-9_]{3,50}$");
+
+string ObtemIdUsuarioLogado(ClaimsPrincipal usuarioLogado) =>
+  usuarioLogado?.Identity?.Name ?? "";
+
+bool UsuarioEstahAutenticado(ClaimsPrincipal usuarioLogado) =>
+  usuarioLogado?.Identity?.IsAuthenticated ?? false;
+
+bool UsuarioEhAdmin(ClaimsPrincipal? usuarioLogado) =>
+  usuarioLogado?.IsInRole("admin") ?? false;
+
+string CriaHash(string senha) => CryptoHelper.Crypto.HashPassword(senha);
+
+bool SenhaConfere(string hashArmazenado, string senhaInformada) =>
+  CryptoHelper.Crypto.VerifyHashedPassword(hashArmazenado, senhaInformada);
+
+string CriaToken(Usuario usuario)
+{
   // Cria a lista de claims contendo id do usuário, o nome e o papel
   var afirmacoes = new[]
   {
@@ -609,41 +613,28 @@ app.MapPost("/api/login", ([FromServices] tarefasContext _db,
   };
 
   // Define expiração do token em 5 minutos
-  var dataHoraExpiracao = DateTime.Now.AddMinutes(5);
+  var dataHoraExpiracao = DateTime.Now.AddMinutes(ConfiguracoesSeguranca.minutosValidade);
 
-  // Recupera a chave de criptografia do token
-  var chaveSimetrica = new SymmetricSecurityKey(
-    Encoding.UTF8.GetBytes(builder.Configuration["ConfiguracoesJwt:Chave"])
-  );
-
-  // Cria o mecanismo de criptografia do token
+  // Cria mecanismo de credenciais, indicando chave e algoritmo
   var credenciais = new SigningCredentials(
-    chaveSimetrica,
+    ConfiguracoesSeguranca.chaveSimetrica,
     SecurityAlgorithms.HmacSha256
   );
 
-  // Aplica as configurações do token
-  var tokenDescriptor = new JwtSecurityToken(
-    issuer: emissor,
-    audience: audiencia,
+  // Cria o token
+  var token = new JwtSecurityToken(
+    issuer: ConfiguracoesSeguranca.emissor,
+    audience: ConfiguracoesSeguranca.audiencia,
     claims: afirmacoes,
     expires: dataHoraExpiracao,
     signingCredentials: credenciais
   );
 
-  // Cria o token JWT
-  var stringToken = new JwtSecurityTokenHandler().WriteToken(tokenDescriptor);
+  // Converte o token JWT para string
+  var stringToken = new JwtSecurityTokenHandler().WriteToken(token);
 
-  // Retorna 200, com o token
-  return Results.Ok(stringToken);
-})
-// Permite acesso anônimo (não logado)
-.AllowAnonymous()
-// Documentação OpenAPI
-.Produces(StatusCodes.Status200OK)
-.Produces(StatusCodes.Status401Unauthorized);
-
-app.Run();
+  return stringToken;
+}
 
 // Define formato dos dados fornecidos para login
 public record DadosLogin(string usuario, string senha);
