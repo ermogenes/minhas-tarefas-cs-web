@@ -85,14 +85,21 @@ Autenticação e autorização com JWT:
 dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer
 ```
 
-# Solução
+# Loop JSON
 
+```cs
+builder.Services.Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(opt =>
+{
+  opt.SerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
+});
+```
+
+# Solução
 ```
 dotnet new sln
 ```
 
 # Testes
-
 Criar a solução:
 ```
 dotnet new xunit -o Tarefas.Tests
@@ -106,9 +113,8 @@ dotnet add reference ../Tarefas/Tarefas.csproj
 Adicionar os pacotes:
 ```
 dotnet add package Microsoft.AspNetCore.Mvc.Testing
-```
-```
-dotnet add package Moq
+dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer
+dotnet add package CryptoHelper
 ```
 
 Tornar o `Program` do projeto acessível aos testes:
@@ -117,3 +123,11 @@ Tornar o `Program` do projeto acessível aos testes:
     <InternalsVisibleTo Include="Tarefas.Tests" />
   </ItemGroup>
 ```
+
+Criar uma instância de `WebApplicationFactory<Program>`. Executando `CreateClient()` você tem acesso a uma instância de `Program`.
+
+É possível sobrescrever `IHost CreateHost(IHostBuilder builder)` e alterar como desejar os objetos injetados.
+
+O exemplo remove o repositório injetado e injeta um novo que usa outro contexto (no app é MySQL, nos testes é Sqlite em memória). Também faz uma carga inicial (que funciona como _Arrange_ dos testes).
+
+Outra estratégia possível é não usar repositório, e reinjetar diretamente um contexto. [Não é recomendado](https://docs.microsoft.com/pt-br/ef/core/testing/choosing-a-testing-strategy) utilizar _In Memory Databases_ para [testes de integração](https://docs.microsoft.com/pt-br/aspnet/core/test/integration-tests?view=aspnetcore-6.0).
