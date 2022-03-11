@@ -1,4 +1,4 @@
-# tarefas-cs-web
+# minhas-tarefas-cs-web
 Uma aplicação em C# (web) com Minimal APIs, EFCore 6, MySQL e Pomelo
 
 [![Build and test](https://github.com/ermogenes/minhas-tarefas-cs-web/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/ermogenes/minhas-tarefas-cs-web/actions/workflows/build-and-test.yml)
@@ -113,8 +113,6 @@ dotnet add reference ../Tarefas/Tarefas.csproj
 Adicionar os pacotes:
 ```
 dotnet add package Microsoft.AspNetCore.Mvc.Testing
-dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer
-dotnet add package CryptoHelper
 ```
 
 Tornar o `Program` do projeto acessível aos testes:
